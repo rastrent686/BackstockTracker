@@ -6,6 +6,7 @@
 <title>Back Room Stock</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{
@@ -114,9 +115,12 @@
     body{background:#fff}
     .wrap,.fab,header.app,.scrim,.sheet,.scanner{display:none !important}
     #print-root{display:block}
-    .p-head{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:2px solid #000;padding-bottom:8px;margin-bottom:12px}
+    .p-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;border-bottom:2px solid #000;padding-bottom:8px;margin-bottom:12px}
     .p-title{font-size:20px;font-weight:800;font-family:var(--sans)}
     .p-sub{font-size:11px;font-family:var(--mono)}
+    .p-qr{display:flex;flex-direction:column;align-items:center;gap:4px;flex:none}
+    .p-qr svg{width:96px;height:96px;display:block}
+    .p-qr .l{font-size:8px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-family:var(--mono);text-align:center;max-width:110px}
     .p-zone{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #000;padding:10px 0 3px;margin-top:8px}
     .p-grid{display:grid;grid-template-columns:1fr 1fr;gap:0}
     .p-item{border:1px solid #bbb;border-radius:6px;padding:8px 10px;margin:6px;display:flex;align-items:center;justify-content:space-between;gap:10px;break-inside:avoid}
@@ -238,7 +242,8 @@
      ======================================================================= */
   var CONFIG = {
     SUPABASE_URL: "https://uzrqjbewlcokvhedqrzd.supabase.co",        // e.g. "https://abcdxyz.supabase.co"
-    SUPABASE_ANON_KEY: "sb_publishable_UWZAPZC3alMJKaSzSlL7TQ_IydmWAMl"    // the "anon public" key
+    SUPABASE_ANON_KEY: "sb_publishable_UWZAPZC3alMJKaSzSlL7TQ_IydmWAMl",    // the "anon public" key
+    APP_URL: ""   // blank = use this page's own URL for the printed QR
   };
   /* ======================================================================= */
 
@@ -511,12 +516,26 @@
       catch(_){ svg.parentNode.innerHTML = '<div style="font:11px monospace;color:#999">'+esc(v)+'</div>'; }
     }
   }
+  function qrSvg(text, px){
+    var v = (text||"").trim();
+    if(!v || !window.qrcode) return "";
+    try{
+      var qr = window.qrcode(0, "M");
+      qr.addData(v);
+      qr.make();
+      var count = qr.getModuleCount();
+      var cell = Math.max(1, Math.floor((px||96)/count));
+      return qr.createSvgTag({cellSize:cell, margin:0});
+    }catch(e){ return ""; }
+  }
   function buildPrint(){
     var root = $("#print-root"), store = $("#storeName").value.trim();
     var when = new Date().toLocaleDateString([], {year:"numeric", month:"short", day:"numeric"});
     var g = grouped(""), keys = Object.keys(g).sort();
-    var html = '<div class="p-head"><div class="p-title">Back Room Stock'+(store?" &middot; "+esc(store):"")+'</div>'+
-               '<div class="p-sub">'+items.length+' items &middot; printed '+when+'</div></div>';
+    var appUrl = CONFIG.APP_URL || (location.origin + location.pathname);
+    var html = '<div class="p-head"><div class="p-head-left"><div class="p-title">Back Room Stock'+(store?" &middot; "+esc(store):"")+'</div>'+
+               '<div class="p-sub">'+items.length+' items &middot; printed '+when+'</div></div>'+
+               '<div class="p-qr">'+qrSvg(appUrl, 96)+'<span class="l">Scan to open on your phone</span></div></div>';
     keys.forEach(function(z){
       html += '<div class="p-zone">'+esc(z)+'</div><div class="p-grid">';
       g[z].forEach(function(it){
