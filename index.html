@@ -93,6 +93,9 @@
   .upc-scan{flex:none;width:50px;border:1px solid var(--line);border-radius:9px;background:var(--ink);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer}
   .upc-scan:active{transform:translateY(1px)}
   .hint{font-size:12px;color:var(--ink-2);margin-top:5px;font-weight:400;text-transform:none;letter-spacing:0}
+  .hint:empty{display:none}
+  .hint.ok{color:var(--good)}
+  .hint.warn{color:var(--warn)}
   .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .sheet-actions{display:flex;gap:8px;margin-top:6px}
   .danger{color:var(--accent);background:#fff;border-color:var(--line)}
@@ -198,6 +201,7 @@
   <div class="field">
     <label for="fName">Item</label>
     <input id="fName" autocomplete="off" placeholder="e.g. Monster Zero 16oz" />
+    <div class="hint" id="nameHint" aria-live="polite"></div>
   </div>
   <div class="two">
     <div class="field">
@@ -243,7 +247,8 @@
   var CONFIG = {
     SUPABASE_URL: "https://uzrqjbewlcokvhedqrzd.supabase.co",        // e.g. "https://abcdxyz.supabase.co"
     SUPABASE_ANON_KEY: "sb_publishable_UWZAPZC3alMJKaSzSlL7TQ_IydmWAMl",    // the "anon public" key
-    APP_URL: ""   // blank = use this page's own URL for the printed QR
+    APP_URL: "",   // blank = use this page's own URL for the printed QR
+    PRODUCT_LOOKUP: true   // set false to stop auto-filling item names from the public UPC databases
   };
   /* ======================================================================= */
 
@@ -429,6 +434,7 @@
 
   function openSheet(id){
     editingId = id || null;
+    lookupSeq++; lookupPending = ""; setNameHint("");
     var t = $("#sheetTitle"), del = $("#deleteBtn");
     if(id){
       var it = find(id);
@@ -466,12 +472,102 @@
     render(); deleteItemRemote(id); closeSheet();
   }
 
+  /* ---------- product lookup (UPC -> name) ----------
+     Best effort only: the Open*Facts databases are free, need no key, and allow
+     browser calls. Food covers most of a c-store; products/beauty backfill the
+     rest. They're crowd-sourced, so a miss (or an odd name) just means you type
+     it yourself. Commercial APIs like UPCitemdb are not usable here -- they
+     refuse cross-origin browser requests and would need a server to proxy. */
+  var lookupCache = {};      // upc -> name ("" = known miss)
+  var lookupSeq = 0;         // guards against a newer scan being clobbered by an older reply
+  var lookupPending = "";
+
+  function fetchJson(url, ms){
+    if(!window.fetch) return Promise.reject(new Error("no fetch"));
+    var ctl = window.AbortController ? new AbortController() : null;
+    var timer = setTimeout(function(){ if(ctl) ctl.abort(); }, ms || 6000);
+    return fetch(url, ctl ? {signal:ctl.signal} : {}).then(function(r){
+      clearTimeout(timer);
+      if(!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    }, function(e){ clearTimeout(timer); throw e; });
+  }
+
+  var LOOKUP_HOSTS = ["world.openfoodfacts.org", "world.openproductsfacts.org", "world.openbeautyfacts.org"];
+
+  /* These store UPC-A as a 13-digit EAN, so try the zero-padded form too. */
+  function upcVariants(code){
+    var out = [code];
+    if(code.length === 12) out.push("0" + code);
+    if(code.length === 13 && code.charAt(0) === "0") out.push(code.slice(1));
+    return out;
+  }
+  function offName(d){
+    var p = d && d.product; if(!p) return "";
+    var n = (p.product_name || "").trim(); if(!n) return "";
+    var brand = (p.brands || "").split(",")[0].trim();
+    if(brand && n.toLowerCase().indexOf(brand.toLowerCase()) === -1) n = brand + " " + n;
+    var qty = (p.quantity || "").trim();
+    if(qty && n.toLowerCase().indexOf(qty.toLowerCase()) === -1) n = n + " " + qty;
+    return n;
+  }
+  function lookupOne(host, code){
+    return fetchJson("https://" + host + "/api/v2/product/" + encodeURIComponent(code) +
+                     ".json?fields=product_name,brands,quantity")
+      .then(function(d){ return offName(d); })
+      .catch(function(){ return ""; });   // 404 = not in this database
+  }
+  /* Fired in parallel so a miss costs one round trip, not one per database. */
+  function lookupProduct(code){
+    if(lookupCache[code] != null) return Promise.resolve(lookupCache[code]);
+    var codes = upcVariants(code), jobs = [];
+    LOOKUP_HOSTS.forEach(function(h){ codes.forEach(function(c){ jobs.push(lookupOne(h, c)); }); });
+    return Promise.all(jobs).then(function(names){
+      var hit = "";
+      for(var i = 0; i < names.length; i++){ if(names[i]){ hit = names[i]; break; } }   // jobs are in priority order
+      hit = hit.replace(/\s+/g, " ").trim().slice(0, 90);
+      lookupCache[code] = hit;
+      return hit;
+    });
+  }
+
+  function setNameHint(msg, tone){
+    var el = $("#nameHint");
+    el.textContent = msg || "";
+    el.className = "hint" + (tone ? " " + tone : "");
+  }
+  function autofillName(upc){
+    if(CONFIG.PRODUCT_LOOKUP === false) return;
+    var code = String(upc || "").replace(/\D/g, "");
+    if(!code || $("#fName").value.trim()){ setNameHint(""); return; }
+    if(lookupPending === code) return;
+    lookupPending = code;
+    var seq = ++lookupSeq;
+    setNameHint("Looking up product…");
+    lookupProduct(code).then(function(name){
+      lookupPending = "";
+      if(seq !== lookupSeq || !sheetIsOpen()) return;                    // superseded, or sheet closed
+      if($("#fUpc").value.replace(/\D/g, "") !== code) return;           // UPC changed under us
+      if($("#fName").value.trim()){ setNameHint(""); return; }           // user typed it first
+      if(name){
+        $("#fName").value = name;
+        setNameHint("Auto-filled from product database — edit if it’s wrong.", "ok");
+        var ae = document.activeElement;
+        if(!ae || ae === document.body || ae === $("#fName")){
+          var q = $("#fQty"); q.focus(); if(q.select) q.select();
+        }
+      }else{
+        setNameHint("No match found — type the name.", "warn");
+      }
+    });
+  }
+
   /* ---------- scan flow ---------- */
   function handleScan(code){
     if(!code) return;
     var m = findByUpc(code);
     if(m){ openSheet(m.id); setTimeout(function(){ var q=$("#fQty"); q.focus(); if(q.select) q.select(); }, 90); }
-    else { openSheet(null); $("#fUpc").value = code; setTimeout(function(){ $("#fName").focus(); }, 90); }
+    else { openSheet(null); $("#fUpc").value = code; setTimeout(function(){ $("#fName").focus(); }, 90); autofillName(code); }
   }
 
   /* ---------- camera scanner ---------- */
@@ -552,7 +648,7 @@
   /* ---------- events ---------- */
   $("#addBtn").addEventListener("click", function(){ openSheet(null); });
   $("#scanBtn").addEventListener("click", function(){ Scanner.open("Scan to count or add", handleScan); });
-  $("#fUpcScan").addEventListener("click", function(){ Scanner.open("Scan barcode", function(code){ $("#fUpc").value = code; }); });
+  $("#fUpcScan").addEventListener("click", function(){ Scanner.open("Scan barcode", function(code){ $("#fUpc").value = code; autofillName(code); }); });
   $("#scanClose").addEventListener("click", function(){ Scanner.close(); });
   $("#scanManual").addEventListener("click", function(){ Scanner.close().then(function(){ if(!sheetIsOpen()) openSheet(null); setTimeout(function(){ $("#fUpc").focus(); }, 90); }); });
 
@@ -561,7 +657,8 @@
   $("#scrim").addEventListener("click", closeSheet);
   $("#search").addEventListener("input", render);
 
-  $("#fUpc").addEventListener("keydown", function(e){ if(e.key==="Enter"){ e.preventDefault(); $("#fName").focus(); } });
+  $("#fUpc").addEventListener("change", function(){ autofillName($("#fUpc").value); });
+  $("#fUpc").addEventListener("keydown", function(e){ if(e.key==="Enter"){ e.preventDefault(); autofillName($("#fUpc").value); $("#fName").focus(); } });
   $("#fName").addEventListener("keydown", function(e){ if(e.key==="Enter"){ e.preventDefault(); $("#fQty").focus(); } });
   $("#fQty").addEventListener("keydown", function(e){ if(e.key==="Enter"){ e.preventDefault(); $("#fZone").focus(); } });
   $("#fZone").addEventListener("keydown", function(e){ if(e.key==="Enter"){ e.preventDefault(); saveFromSheet(); } });
