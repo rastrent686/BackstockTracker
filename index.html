@@ -254,10 +254,12 @@
 
   var KEY_ITEMS = "backroom:items";   // used only in local fallback mode
   var KEY_STORE = "backroom:store";
+  var KEY_CATALOG = "backroom:catalog";
   var BACKEND = "local";
   var sb = null;
 
   var items = [];
+  var catalog = {};   // upc -> name your store has used before; outlives the item itself
   var editingId = null;
   var lastZone = "";
 
@@ -302,6 +304,33 @@
       localSet(KEY_ITEMS, JSON.stringify(items));
     }
   }
+  /* Remember what this store calls a UPC, so the next scan fills itself in.
+     Kept separate from items on purpose: counting an item to zero and deleting
+     it shouldn't make the app forget the name. */
+  function rememberName(upc, name){
+    var k = String(upc||"").trim(), n = String(name||"").trim();
+    if(!k || !n || catalog[k] === n) return;
+    catalog[k] = n;
+    if(BACKEND==="supabase"){
+      sb.from("backroom_upc_names").upsert({upc:k, name:n, updated:Date.now()}).then(function(res){ if(res && res.error) console.error(res.error); });
+    }else{
+      localSet(KEY_CATALOG, JSON.stringify(catalog));
+    }
+  }
+  /* One-time backfill so names typed before this feature existed still count. */
+  function seedCatalogFromItems(){
+    var rows = [];
+    items.forEach(function(it){
+      var k = (it.upc||"").trim(), n = (it.name||"").trim();
+      if(k && n && catalog[k] !== n){ catalog[k] = n; rows.push({upc:k, name:n, updated:it.updated||Date.now()}); }
+    });
+    if(!rows.length) return;
+    if(BACKEND==="supabase"){
+      sb.from("backroom_upc_names").upsert(rows).then(function(res){ if(res && res.error) console.error(res.error); });
+    }else{
+      localSet(KEY_CATALOG, JSON.stringify(catalog));
+    }
+  }
   function saveStoreName(v){
     if(BACKEND==="supabase"){
       sb.from("backroom_meta").upsert({id:"store", value:v}).then(function(res){ if(res && res.error) console.error(res.error); });
@@ -317,16 +346,23 @@
       $("#mode").textContent = " \u00b7 Live sync on";
       return sb.from("backroom_items").select("*").then(function(res){
         items = ((res && res.data) || []).map(itemFromRow);
+        return sb.from("backroom_upc_names").select("*");
+      }).then(function(res){
+        if(res && res.error) console.warn("UPC name table unavailable:", res.error.message);
+        ((res && res.data) || []).forEach(function(r){ if(r.upc) catalog[r.upc] = r.name || ""; });
         return sb.from("backroom_meta").select("value").eq("id","store").maybeSingle();
       }).then(function(res){
         if(res && res.data && res.data.value){ $("#storeName").value = res.data.value; }
-        render(); subscribeRealtime();
+        render(); subscribeRealtime(); seedCatalogFromItems();
       }).catch(function(e){ console.error(e); render(); });
     }
     return localGet(KEY_ITEMS).then(function(raw){
       if(raw){ try{ items = JSON.parse(raw)||[]; }catch(e){ items = []; } }
+      return localGet(KEY_CATALOG);
+    }).then(function(raw){
+      if(raw){ try{ catalog = JSON.parse(raw)||{}; }catch(e){ catalog = {}; } }
       return localGet(KEY_STORE);
-    }).then(function(store){ if(store){ $("#storeName").value = store; } render(); });
+    }).then(function(store){ if(store){ $("#storeName").value = store; } render(); seedCatalogFromItems(); });
   }
 
   function subscribeRealtime(){
@@ -340,6 +376,10 @@
             if(i>=0) items[i] = it; else items.push(it);
           }
           render();
+        })
+        .on("postgres_changes", {event:"*", schema:"public", table:"backroom_upc_names"}, function(p){
+          if(p.eventType==="DELETE"){ var ou = p.old && p.old.upc; if(ou) delete catalog[ou]; }
+          else if(p.new && p.new.upc){ catalog[p.new.upc] = p.new.name||""; }
         })
         .on("postgres_changes", {event:"*", schema:"public", table:"backroom_meta"}, function(p){
           if(p.new && p.new.id==="store"){ $("#storeName").value = p.new.value||""; }
@@ -464,7 +504,7 @@
     }else{
       it = {id:uid(), upc:upc, name:name, qty:qty, zone:zone, updated:Date.now()}; items.push(it);
     }
-    render(); saveItem(it); closeSheet();
+    render(); saveItem(it); rememberName(upc, name); closeSheet();
   }
   function deleteCurrent(){
     if(!editingId) return;
@@ -536,10 +576,29 @@
     el.textContent = msg || "";
     el.className = "hint" + (tone ? " " + tone : "");
   }
+  function focusQtyIfIdle(){
+    var ae = document.activeElement;
+    if(!ae || ae === document.body || ae === $("#fName")){
+      var q = $("#fQty"); q.focus(); if(q.select) q.select();
+    }
+  }
   function autofillName(upc){
-    if(CONFIG.PRODUCT_LOOKUP === false) return;
-    var code = String(upc || "").replace(/\D/g, "");
-    if(!code || $("#fName").value.trim()){ setNameHint(""); return; }
+    var raw = String(upc || "").trim();
+    var code = raw.replace(/\D/g, "");
+    if(!raw || $("#fName").value.trim()){ setNameHint(""); return; }
+
+    /* Your own history wins over the public databases -- it's what the store
+       actually calls the thing, and it's right even when they have no record. */
+    var known = catalog[raw] || (code && catalog[code]) || "";
+    if(known){
+      lookupSeq++;   // cancel any in-flight web lookup so it can't clear this hint
+      $("#fName").value = known;
+      setNameHint("Filled from your store’s saved names.", "ok");
+      focusQtyIfIdle();
+      return;
+    }
+
+    if(CONFIG.PRODUCT_LOOKUP === false || !code){ setNameHint(""); return; }
     if(lookupPending === code) return;
     lookupPending = code;
     var seq = ++lookupSeq;
@@ -552,10 +611,7 @@
       if(name){
         $("#fName").value = name;
         setNameHint("Auto-filled from product database — edit if it’s wrong.", "ok");
-        var ae = document.activeElement;
-        if(!ae || ae === document.body || ae === $("#fName")){
-          var q = $("#fQty"); q.focus(); if(q.select) q.select();
-        }
+        focusQtyIfIdle();
       }else{
         setNameHint("No match found — type the name.", "warn");
       }
